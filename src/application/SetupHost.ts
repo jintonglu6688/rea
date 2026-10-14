@@ -31,6 +31,7 @@ import {
   skillDestinations,
   canonicalSkillNeedsInstall,
   installCanonicalSkill,
+  validateCanonicalSkillDirectories,
 } from "./SetupSkill.js";
 import {
   clientConfigurationAligned,
@@ -44,7 +45,10 @@ import {
   RegularFileCleanupFailure,
   retryRegularFileCleanup,
 } from "./RegularFileRead.js";
-import { providerRegistrationEnvironment } from "./SetupRegistrationEnvironment.js";
+import {
+  explicitSetupRegistrationEnvironment,
+  providerRegistrationEnvironment,
+} from "./SetupRegistrationEnvironment.js";
 import {
   msixPackagesDirectory,
   packagePrivateLauncherBlocker,
@@ -55,21 +59,22 @@ import type {
   SetupProviderEnvironment,
 } from "./SetupTypes.js";
 import type { DoctorScope } from "./Doctor.js";
+import { CURRENT_ENTRYPOINT_PATH } from "../process/CurrentEntrypointPath.js";
+import { analysisProviderSelectorSchema } from "../contracts/providerSelection.js";
 
 /** Resolve the executable and arguments used in a managed MCP registration. */
 export const setupRegistrationCommand = (
   platform: NodeJS.Platform,
   packageRunner: PackageRunner | undefined,
-): readonly string[] =>
-  packageRunner !== undefined
-    ? packageRunnerRegistrationCommand(packageRunner, platform)
-    : platform === "win32"
-      ? [
-          process.execPath,
-          resolve(process.argv[1] ?? PRODUCT_IDENTITY.cliBinary),
-          "mcp",
-        ]
-      : [resolve(process.argv[1] ?? PRODUCT_IDENTITY.cliBinary), "mcp"];
+  entrypointPath: string | undefined,
+): readonly string[] => {
+  if (packageRunner !== undefined)
+    return packageRunnerRegistrationCommand(packageRunner, platform);
+  if (entrypointPath === undefined || entrypointPath.length === 0) return [];
+  return platform === "win32"
+    ? [process.execPath, entrypointPath, "mcp"]
+    : [entrypointPath, "mcp"];
+};
 
 /**
  * The launcher setup registers, and why it must not be registered when it
@@ -83,14 +88,17 @@ const setupRegistration = (
   const registrationCommand = setupRegistrationCommand(
     platform,
     invokingPackageRunner(environment, platform),
+    CURRENT_ENTRYPOINT_PATH,
   );
   const registrationCommandBlocker =
-    platform === "win32"
-      ? packagePrivateLauncherBlocker(
-          registrationCommand,
-          msixPackagesDirectory(homeDirectory, environment),
-        )
-      : undefined;
+    registrationCommand.length === 0
+      ? "REA could not determine the current executable entrypoint. Run setup through the installed REA CLI or a supported package runner before configuring clients."
+      : platform === "win32"
+        ? packagePrivateLauncherBlocker(
+            registrationCommand,
+            msixPackagesDirectory(homeDirectory, environment),
+          )
+        : undefined;
   return registrationCommandBlocker === undefined
     ? { registrationCommand }
     : { registrationCommand, registrationCommandBlocker };
@@ -162,6 +170,17 @@ export const systemSetupHost = (
       scope?: DoctorScope,
     ): Promise<SetupInitialState> => {
       const diagnosis = await runDoctor(undefined, doctorHost, scope);
+      const providerEnvironment: SetupProviderEnvironment = {
+        ...providerRegistrationEnvironment(diagnosis.providerInspections ?? []),
+        ...doctorHost.providerRegistrationEnvironment?.(),
+        ...explicitSetupRegistrationEnvironment(environment),
+        ...(diagnosis.hopperPath === undefined
+          ? {}
+          : { HOPPER_LAUNCHER_PATH: diagnosis.hopperPath }),
+      };
+      const requestedProvider = analysisProviderSelectorSchema.safeParse(
+        environment.REA_ANALYSIS_PROVIDER,
+      );
       return {
         ...(diagnosis.hopperPath === undefined
           ? {}
@@ -171,14 +190,14 @@ export const systemSetupHost = (
         diagnosis.hopperPath === environment.HOPPER_LAUNCHER_PATH
           ? { hopperLauncherConfigured: true }
           : {}),
-        providerEnvironment: {
-          ...providerRegistrationEnvironment(
-            diagnosis.providerInspections ?? [],
-          ),
-          ...(diagnosis.hopperPath === undefined
-            ? {}
-            : { HOPPER_LAUNCHER_PATH: diagnosis.hopperPath }),
-        },
+        providerConfigured:
+          diagnosis.hopperPath !== undefined ||
+          diagnosis.providerInspections?.some(
+            ({ configured }) => configured,
+          ) === true ||
+          providerEnvironment.REA_JEB_MCP_URL !== undefined ||
+          (requestedProvider.success && requestedProvider.data !== "auto"),
+        providerEnvironment,
         doctor: diagnosis,
       };
     },
@@ -198,18 +217,29 @@ export const systemSetupHost = (
         return {
           status: "installed",
           launcherPath: result.launcherPath,
+          ...(result.openFailure === undefined
+            ? {}
+            : {
+                warning: `Hopper was installed, but macOS could not open it: ${result.openFailure}. Open ${result.launcherPath} manually to complete first-run setup.`,
+              }),
           ...(result.cleanupFailure === undefined
             ? {}
             : { cleanupFailure: result.cleanupFailure }),
         };
       const failure = setupInstallFailure(result.reason);
-      if (result.cleanupFailure === undefined) return failure;
-      return failure.status === "failed"
-        ? {
-            ...failure,
-            remediation: `${failure.remediation} ${result.cleanupFailure}`,
-          }
-        : failure;
+      const diagnostic = setupInstallerDiagnostic(result.diagnostic);
+      return {
+        ...failure,
+        remediation: [
+          failure.remediation,
+          ...(diagnostic === undefined
+            ? []
+            : [`Installer detail: ${diagnostic}`]),
+          ...(result.cleanupFailure === undefined
+            ? []
+            : [result.cleanupFailure]),
+        ].join(" "),
+      };
     },
     detectedClients: () => detectClients(homeDirectory, platform, environment),
     supportedClients: () =>
@@ -223,6 +253,13 @@ export const systemSetupHost = (
         platform,
         resources,
       ),
+    validateSkillDirectories: (clientIds) =>
+      validateCanonicalSkillDirectories(
+        homeDirectory,
+        clientIds,
+        environment,
+        platform,
+      ),
     installSkill: (clientIds) =>
       installCanonicalSkill(
         homeDirectory,
@@ -234,6 +271,21 @@ export const systemSetupHost = (
       ),
     doctor: (scope) => runDoctor(undefined, doctorHost, scope),
   };
+};
+
+const setupInstallerDiagnostic = (
+  value: string | undefined,
+): string | undefined => {
+  if (value === undefined) return undefined;
+  const normalized = value
+    .replace(/\u001b(?:\[[0-9;?]*[ -/]*[@-~]|\([0-9A-Za-z]|[@-Z\\^_])/gu, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (normalized === "") return undefined;
+  return normalized.length <= 400
+    ? normalized
+    : `${normalized.slice(0, 397).trimEnd()}...`;
 };
 
 const clientConfigurationOperations = (resources: ArtifactResourceScope) => ({
