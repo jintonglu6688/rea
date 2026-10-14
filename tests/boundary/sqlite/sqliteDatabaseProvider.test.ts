@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { expect, it as nativeTest, onTestFinished } from "vitest";
+import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
 import { SqliteDatabaseProvider } from "../../../src/sqlite/SqliteDatabaseProvider.js";
 import { spawnOwnedProviderProcess } from "../../../src/process/ProviderProcess.js";
 import { PrivateRuntimeRoot } from "../../../src/process/PrivateRuntimeRoot.js";
@@ -356,6 +357,73 @@ it("does not execute views when selecting rows", async () => {
   });
 });
 
+nativeTest.each(["absent.db", "absent-parent/absent.db"])(
+  "classifies a missing %s as an invalid value",
+  async (name) => {
+    const workspace = await createTestWorkspace("rea-sqlite-missing-");
+    onTestFinished(() => removeTestWorkspace(workspace.root));
+    const path = workspace.path(name);
+    const provider = createProvider();
+    onTestFinished(() => provider.close());
+    const result = await provider.inspect({ path });
+    if (result.ok) throw new Error("Expected a missing database rejection");
+    expect(projectAnalysisError(result.error)).toMatchObject({
+      details: {
+        issues: [
+          {
+            path: ["path"],
+            reason: "invalid_value",
+            message: `Selected SQLite database does not exist: ${path}`,
+          },
+        ],
+      },
+    });
+  },
+);
+
+it("attributes table and column selection failures to their own arguments", async () => {
+  const { database } = await createFixture();
+  const provider = createProvider();
+  onTestFinished(() => provider.close());
+  const projection = async (selection: {
+    table: string;
+    columns?: string[];
+  }) => {
+    const result = await provider.inspect({
+      path: database.path,
+      row_limit: 1,
+      ...selection,
+    });
+    if (result.ok) throw new Error("Expected a rejected selection");
+    return projectAnalysisError(result.error);
+  };
+  expect(
+    await projection({ table: "records", columns: ["nope"] }),
+  ).toMatchObject({
+    details: {
+      issues: [
+        {
+          path: ["columns"],
+          reason: "invalid_format",
+          message:
+            "Selected column does not exist with that exact name in table records: nope",
+        },
+      ],
+    },
+  });
+  expect(await projection({ table: "absent" })).toMatchObject({
+    details: { issues: [{ path: ["table"] }] },
+  });
+  const selected = await provider.inspect({
+    path: database.path,
+    table: "records",
+    columns: ["id"],
+    row_limit: 1,
+  });
+  if (!selected.ok) throw selected.error;
+  expect(selected.value.result).toMatchObject({ rows: { columns: ["id"] } });
+});
+
 it("rejects malformed databases without altering the selected file", async () => {
   const workspace = await createTestWorkspace("rea-sqlite-invalid-");
   onTestFinished(() => removeTestWorkspace(workspace.root));
@@ -558,27 +626,32 @@ nativeTest(
     const controller = new AbortController();
     let ownedRoot = "";
     let pid: number | undefined;
-    const provider = new SqliteDatabaseProvider({}, async (spawn) => {
-      ownedRoot = spawn.cwd ?? "";
-      const requestPath = spawn.arguments[2];
-      if (requestPath === undefined)
-        throw new Error("SQLite worker arguments missing");
-      const launched = await spawnOwnedProviderProcess({
-        ...spawn,
-        arguments: [
-          "--input-type=module",
-          "-e",
-          `await import(${JSON.stringify(workerUrl.href)}); process.stdout.write('ready\\n'); setInterval(() => {}, 1000);`,
-          "sqlite-worker-test",
-          requestPath,
-        ],
-      });
-      pid = launched.process.pid;
-      await waitForProviderProcessReady(launched.process);
-      await access(`${ownedRoot}/reply.json`);
-      setImmediate(() => controller.abort());
-      return launched;
-    });
+    const provider = new SqliteDatabaseProvider(
+      process.platform === "win32" && process.env.SystemRoot !== undefined
+        ? { SystemRoot: process.env.SystemRoot }
+        : {},
+      async (spawn) => {
+        ownedRoot = spawn.cwd ?? "";
+        const requestPath = spawn.arguments[2];
+        if (requestPath === undefined)
+          throw new Error("SQLite worker arguments missing");
+        const launched = await spawnOwnedProviderProcess({
+          ...spawn,
+          arguments: [
+            "--input-type=module",
+            "-e",
+            `await import(${JSON.stringify(workerUrl.href)}); process.stdout.write('ready\\n'); setInterval(() => {}, 1000);`,
+            "sqlite-worker-test",
+            requestPath,
+          ],
+        });
+        pid = launched.process.pid;
+        await waitForProviderProcessReady(launched.process);
+        await access(`${ownedRoot}/reply.json`);
+        setImmediate(() => controller.abort());
+        return launched;
+      },
+    );
     const result = await provider.inspect(
       { path: database.path, table: "records" },
       { signal: controller.signal },

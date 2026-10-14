@@ -9,7 +9,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { CdpBrowserProvider } from "../dist/browser/CdpBrowserProvider.js";
-import { waitForBrowserDevtoolsPort } from "../dist/browser/BrowserProcessStartup.js";
+import {
+  BROWSER_DEVTOOLS_STARTUP_TIMEOUT_MS,
+  waitForBrowserDevtoolsPort,
+} from "../dist/browser/BrowserProcessStartup.js";
 import { createBrowserScenarioProvider } from "../dist/composition/browserScenario.js";
 import {
   inspectWebPageInputSchema,
@@ -42,12 +45,13 @@ import { verifyBrowserNetworkEvidence } from "./lib/browser-network-e2e.mjs";
 import { verifyBrowserScriptExport } from "./lib/browser-script-export-e2e.mjs";
 import { verifyBrowserModules } from "./lib/browser-module-e2e.mjs";
 import { verifyBrowserDomDestinations } from "./lib/browser-dom-destinations-e2e.mjs";
+import { verifyBrowserSocketTransport } from "./lib/browser-socket-e2e.mjs";
 import { verifyBrowserCaptureMetadataBudget } from "./lib/browser-capture-metadata-budget-e2e.mjs";
 import { artifactCliEvidence, artifactMcpResult } from "./lib/artifact-e2e.mjs";
 import { verifyScenarioEnvironment } from "./lib/browser-scenario-environment-e2e.mjs";
 import { verifyScenarioStorage } from "./lib/browser-scenario-storage-e2e.mjs";
+import { verifyScenarioServiceWorkers } from "./lib/browser-scenario-service-workers-e2e.mjs";
 
-const REAL_BROWSER_STARTUP_TIMEOUT_MS = 60_000;
 const SCENARIO_SECRET_VALUE = "rea-browser-verifier-secret";
 const SCENARIO_URL_SECRET_VALUE = "rea-browser-url-verifier-secret";
 process.env.REA_BROWSER_VERIFIER_SECRET = SCENARIO_SECRET_VALUE;
@@ -92,7 +96,7 @@ try {
     executable,
     activePortPath: join(profile, "DevToolsActivePort"),
     stderr: () => stderr,
-    timeoutMs: REAL_BROWSER_STARTUP_TIMEOUT_MS,
+    timeoutMs: BROWSER_DEVTOOLS_STARTUP_TIMEOUT_MS,
   });
   const endpoint = `http://127.0.0.1:${String(port)}`;
   const provider = new CdpBrowserProvider();
@@ -232,6 +236,13 @@ try {
 
   pageProxy = await startPageCdpProxy(endpoint);
   await verifyPageScopedTransport(provider, pageProxy, site.origin);
+  const browserSocketTransport = await verifyBrowserSocketTransport({
+    provider,
+    profile,
+    endpoint,
+    target,
+    origin: site.origin,
+  });
   const attachedScenarioInput = browserScenario(
     {
       mode: "connect",
@@ -289,6 +300,11 @@ try {
     endpoint,
     targetId: target,
   });
+  process.stderr.write("Browser verifier: scenario service workers\n");
+  const scenarioServiceWorkers = await verifyScenarioServiceWorkers(
+    endpoint,
+    target,
+  );
   const launchedScenario = await createBrowserScenarioProvider(
     process.env,
   ).captureScenario(
@@ -375,6 +391,7 @@ try {
     bundle_cli_and_stdio_mcp: true,
     sessionEvents: session.value.timeline.length,
     pageScopedTransport: true,
+    browserSocketTransport,
     screenshotBytes: screenshot.value.artifact.bytes,
     largeScreenshot,
     popupEvents,
@@ -389,6 +406,7 @@ try {
     scenarioFailure,
     scenarioEnvironment,
     scenarioStorage,
+    scenarioServiceWorkers,
     verified: true,
   };
 } finally {
