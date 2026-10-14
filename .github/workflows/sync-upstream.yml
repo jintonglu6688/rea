@@ -6,8 +6,7 @@ on:
     - cron: "17 19 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: sync-upstream
@@ -21,5 +20,5 @@ jobs:
     steps:
       - name: Merge upstream main without forcing conflicts
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: gh api --method POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main
