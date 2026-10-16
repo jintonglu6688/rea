@@ -203,8 +203,12 @@ export class BinarySession
       stagedSnapshotMatches: (target, profile) =>
         this.matchesSnapshot(target, profile),
     }).then((resolved) =>
-      isAborted(options.signal)
-        ? err(new AnalysisCancelledError("open_binary"))
+      resolved.ok && isAborted(options.signal)
+        ? err(
+            new AnalysisCancelledError("open_binary", {
+              cause: options.signal?.reason,
+            }),
+          )
         : resolved,
     );
   }
@@ -337,7 +341,9 @@ export class BinarySession
         ),
       );
     const runId = randomUUID();
-    const client = route.createClient(target, { runId });
+    const client = route.createClient(target, {
+      runId,
+    });
     const run: SessionRun = { client, route, runId };
     const started = await client.execute("health", {}, options);
     if (!started.ok) {
@@ -499,15 +505,29 @@ export class BinarySession
     if (clearRecords) this.clearSessionRecords();
     this.#clearRuntimeAvailability();
     const fileResources = await this.closeWriteResources();
-    if (!closed.ok && !fileResources.ok)
+    const candidateResources = await this.#providerRouter.closeOwnedResources();
+    const resourceFailures = [
+      ...(fileResources.ok ? [] : [fileResources.error]),
+      ...(candidateResources.ok ? [] : [candidateResources.error]),
+    ];
+    let resourceFailure = resourceFailures[0];
+    for (const next of resourceFailures.slice(1))
+      if (resourceFailure !== undefined)
+        resourceFailure = analysisErrorWithCleanupFailure(
+          resourceFailure,
+          next,
+          "close_binary",
+        );
+    if (!closed.ok && resourceFailure !== undefined)
       return err(
         analysisErrorWithCleanupFailure(
           closed.error,
-          fileResources.error,
+          resourceFailure,
           "close_binary",
         ),
       );
-    return closed.ok ? fileResources : closed;
+    if (!closed.ok) return closed;
+    return resourceFailure === undefined ? ok(null) : err(resourceFailure);
   }
 
   async #retireClient(
@@ -583,7 +603,10 @@ export class BinarySession
       runtimeLineageSnapshots: client?.runtimeLineageSnapshots?.() ?? [],
       requestActivitySnapshots: client?.requestActivitySnapshots?.() ?? [],
       providerOperationHealth: client?.operationHealthSnapshot?.() ?? null,
-      cleanupPending: this.#pendingCleanup !== undefined,
+      cleanupPending:
+        this.#pendingCleanup !== undefined ||
+        this.hasPendingFileResources ||
+        this.#providerRouter.hasPendingOwnedResources(),
     });
   }
 
@@ -918,7 +941,9 @@ export class BinarySession
   ): Promise<Result<null, AnalysisError>> {
     if (previous === undefined) return ok(null);
     const runId = randomUUID();
-    const client = previous.route.createClient(previous.target, { runId });
+    const client = previous.route.createClient(previous.target, {
+      runId,
+    });
     const run: SessionRun = { client, route: previous.route, runId };
     const started = await client.execute("health", {});
     if (started.ok) {
